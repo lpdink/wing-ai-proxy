@@ -27,22 +27,22 @@ func TestSQLiteStore_InsertAndQuery(t *testing.T) {
 	}
 
 	record := Record{
-		RequestID:     "req-001",
-		VirtualAPIKey: "sk-test",
-		ProviderName:  "test-provider",
-		ModelShowName: "gpt-4",
-		ModelRealName: "gpt-4-turbo",
-		RequestStart:  time.Now().Add(-2 * time.Second),
-		FirstByteAt:   time.Now().Add(-1 * time.Second),
-		RequestEnd:    time.Now(),
-		InputTokens:   100,
-		OutputTokens:  200,
+		RequestID:      "req-001",
+		VirtualAPIKey:  "sk-test",
+		ProviderName:   "test-provider",
+		ModelShowName:  "gpt-4",
+		ModelRealName:  "gpt-4-turbo",
+		RequestStart:   time.Now().Add(-2 * time.Second),
+		FirstByteAt:    time.Now().Add(-1 * time.Second),
+		RequestEnd:     time.Now(),
+		InputTokens:    100,
+		OutputTokens:   200,
 		CacheHitTokens: 50,
-		ToolCalls:     []string{"search", "calculator"},
-		IsStream:      false,
-		RequestBody:   `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`,
-		ResponseBody:  `{"id":"chatcmpl-1"}`,
-		StatusCode:    200,
+		ToolCalls:      []string{"search", "calculator"},
+		IsStream:       false,
+		RequestBody:    `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`,
+		ResponseBody:   `{"id":"chatcmpl-1"}`,
+		StatusCode:     200,
 	}
 
 	if err := store.Insert(record); err != nil {
@@ -180,7 +180,7 @@ func TestSSEAggregator_BasicContent(t *testing.T) {
 		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"content":" world"}}]}` + "\n\n",
-		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_cache_hit_tokens":0}}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n",
 		`data: [DONE]` + "\n\n",
 	}
 
@@ -215,7 +215,7 @@ func TestSSEAggregator_ToolCalls(t *testing.T) {
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hello\"}"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"calculator","arguments":"{}"}}]}}]}` + "\n\n",
-		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_cache_hit_tokens":0}}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n",
 		`data: [DONE]` + "\n\n",
 	}
 
@@ -269,7 +269,7 @@ func TestParseUsageFromResponse(t *testing.T) {
 		"usage": {
 			"prompt_tokens": 50,
 			"completion_tokens": 30,
-			"prompt_cache_hit_tokens": 10
+			"prompt_tokens_details": {"cached_tokens": 10}
 		}
 	}`
 
@@ -293,7 +293,7 @@ func TestStreamForwarder(t *testing.T) {
 	// Simulate upstream SSE data
 	upstreamData := `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}` + "\n\n" +
 		`data: {"choices":[{"index":0,"delta":{"content":" there"}}]}` + "\n\n" +
-		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"prompt_cache_hit_tokens":0}}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n" +
 		`data: [DONE]` + "\n\n"
 
 	upstream := bytes.NewReader([]byte(upstreamData))

@@ -106,7 +106,7 @@ func TestChatCompletions_NonStream(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"Hello!"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_cache_hit_tokens":0}}`))
+		w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"Hello!"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}}}`))
 	}))
 	defer upstream.Close()
 
@@ -141,7 +141,7 @@ func TestChatCompletions_Stream(t *testing.T) {
 			`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n",
 			`data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n",
 			`data: {"choices":[{"index":0,"delta":{"content":" world"}}]}` + "\n\n",
-			`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"prompt_cache_hit_tokens":0}}` + "\n\n",
+			`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n",
 			`data: [DONE]` + "\n\n",
 		}
 
@@ -317,4 +317,3 @@ func TestCustomHeaderForwarding(t *testing.T) {
 		t.Errorf("trace header not forwarded")
 	}
 }
-

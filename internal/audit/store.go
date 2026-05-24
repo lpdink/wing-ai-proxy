@@ -95,10 +95,10 @@ func (s *SQLiteStore) Close() error {
 
 // AsyncWriter provides non-blocking audit record submission.
 type AsyncWriter struct {
-	store    Store
-	queue    chan Record
-	done     chan struct{}
-	dropped  int64
+	store   Store
+	queue   chan Record
+	done    chan struct{}
+	dropped int64
 }
 
 // NewAsyncWriter creates an async writer with a buffered channel.

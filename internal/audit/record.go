@@ -17,8 +17,8 @@ type Record struct {
 	OutputTokens   int `json:"output_tokens"`
 	CacheHitTokens int `json:"cache_hit_tokens"`
 
-	ToolCalls  []string `json:"tool_calls"`
-	IsStream   bool     `json:"is_stream"`
+	ToolCalls []string `json:"tool_calls"`
+	IsStream  bool     `json:"is_stream"`
 
 	RequestBody  string `json:"request_body"`
 	ResponseBody string `json:"response_body"`

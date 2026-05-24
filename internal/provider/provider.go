@@ -19,9 +19,9 @@ import (
 
 // ModelInfo represents a model exposed to clients.
 type ModelInfo struct {
-	ID       string `json:"id"`
-	Object   string `json:"object"`
-	OwnedBy  string `json:"owned_by"`
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	OwnedBy string `json:"owned_by"`
 }
 
 // Provider is the abstraction for upstream LLM backends.
@@ -66,8 +66,8 @@ func newOpenAIProvider(cfg config.ProviderConfig) *openAIProvider {
 	}
 }
 
-func (p *openAIProvider) Name() string           { return p.name }
-func (p *openAIProvider) Type() string           { return "openai" }
+func (p *openAIProvider) Name() string              { return p.name }
+func (p *openAIProvider) Type() string              { return "openai" }
 func (p *openAIProvider) Models() map[string]string { return p.models }
 
 func (p *openAIProvider) ChatCompletion(ctx context.Context, body []byte, clientHeaders http.Header) (*http.Response, error) {
@@ -132,7 +132,7 @@ func (p *openAIProvider) ListModels(_ context.Context) []ModelInfo {
 
 // Registry manages the mapping from show_name → Provider and resolves routing.
 type Registry struct {
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 	providers []Provider
 	modelMap  map[string]providerEntry // show_name → (provider, real_name)
 }

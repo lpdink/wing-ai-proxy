@@ -19,8 +19,8 @@ import (
 
 // Handler handles proxy requests.
 type Handler struct {
-	registry      *provider.Registry
-	auditWriter   *audit.AsyncWriter
+	registry    *provider.Registry
+	auditWriter *audit.AsyncWriter
 }
 
 // NewHandler creates a new proxy handler.
@@ -79,7 +79,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if err != nil {
 		availableModels := h.registry.ShowNames()
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error":           fmt.Sprintf("model %q not found", reqBody.Model),
+			"error":            fmt.Sprintf("model %q not found", reqBody.Model),
 			"available_models": availableModels,
 		})
 		return

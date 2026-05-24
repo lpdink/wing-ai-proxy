@@ -50,7 +50,7 @@ func GetLogger(c *gin.Context) *slog.Logger {
 
 // Auth validates the Bearer token against a dynamic set of virtual API keys.
 type Auth struct {
-	mu  sync.RWMutex
+	mu   sync.RWMutex
 	keys map[string]bool
 }
 

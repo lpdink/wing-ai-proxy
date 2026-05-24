@@ -22,16 +22,20 @@ type SSEAggregator struct {
 }
 
 type toolCallAccum struct {
-	ID       string
-	Type     string
-	Name     string
-	ArgsBuf  strings.Builder
+	ID      string
+	Type    string
+	Name    string
+	ArgsBuf strings.Builder
 }
 
 type usageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	CacheHitTokens   int `json:"prompt_cache_hit_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details"`
+}
+
+type promptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // NewSSEAggregator creates a new aggregator.
@@ -113,7 +117,9 @@ func (a *SSEAggregator) Result() (responseBody string, truncated bool, inputToke
 	if a.usage != nil {
 		inputTokens = a.usage.PromptTokens
 		outputTokens = a.usage.CompletionTokens
-		cacheHitTokens = a.usage.CacheHitTokens
+		if a.usage.PromptTokensDetails != nil {
+			cacheHitTokens = a.usage.PromptTokensDetails.CachedTokens
+		}
 	}
 
 	// Collect tool call names
@@ -140,15 +146,15 @@ type sseChoice struct {
 }
 
 type sseDelta struct {
-	Content   string         `json:"content"`
-	ToolCalls []sseToolCall  `json:"tool_calls"`
+	Content   string        `json:"content"`
+	ToolCalls []sseToolCall `json:"tool_calls"`
 }
 
 type sseToolCall struct {
-	Index    int          `json:"index"`
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
-	Function sseFunction  `json:"function"`
+	Index    int         `json:"index"`
+	ID       string      `json:"id"`
+	Type     string      `json:"type"`
+	Function sseFunction `json:"function"`
 }
 
 type sseFunction struct {
@@ -159,10 +165,10 @@ type sseFunction struct {
 // StreamForwarder wraps an upstream response body, forwarding each byte
 // to the client writer while simultaneously feeding the aggregator.
 type StreamForwarder struct {
-	upstream  io.Reader
-	client    io.Writer
+	upstream   io.Reader
+	client     io.Writer
 	aggregator *SSEAggregator
-	flusher   interface{ Flush() }
+	flusher    interface{ Flush() }
 }
 
 // NewStreamForwarder creates a new stream forwarder.
@@ -233,7 +239,9 @@ func ParseUsageFromResponse(body []byte) (inputTokens, outputTokens, cacheHitTok
 	if resp.Usage != nil {
 		inputTokens = resp.Usage.PromptTokens
 		outputTokens = resp.Usage.CompletionTokens
-		cacheHitTokens = resp.Usage.CacheHitTokens
+		if resp.Usage.PromptTokensDetails != nil {
+			cacheHitTokens = resp.Usage.PromptTokensDetails.CachedTokens
+		}
 	}
 
 	for _, choice := range resp.Choices {
