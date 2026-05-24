@@ -1,0 +1,42 @@
+# wing-ai-proxy 配置文件
+# 默认路径: ~/.wing-ai-proxy/config.yaml
+# 可通过命令行参数指定: wing-ai-proxy /path/to/config.yaml
+
+# 监听地址
+host: "127.0.0.1"
+port: 39998
+
+# 虚拟 API Key 列表 — 简单字符串比对，客户端通过 Authorization: Bearer <key> 访问
+# 热加载支持：修改后立即生效，无需重启
+virtual_api_keys:
+  - "sk-abcdefg"
+  - "sk-12345678"
+
+# 上游 Provider 配置
+# 热加载支持：增删 Provider、修改模型映射后立即生效
+providers:
+  - name: dashscope            # provider 唯一标识
+    type: openai               # 协议类型（第一版仅支持 "openai"）
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "sk-xxxx"         # 上游 API Key
+    timeout: 1800s             # 请求超时时间（默认 30 分钟）
+    models:                    # show_name: real_name 映射
+      "ds-v4-flash": "deepseek-v4-flash"
+      "qwen-turbo": "qwen-turbo"
+
+  - name: openai
+    type: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: "sk-yyyy"
+    models:
+      "gpt-4": "gpt-4-turbo"
+      "gpt-3.5": "gpt-3.5-turbo"
+
+# 审计数据库配置
+# 注意：host、port、database 不可热加载，修改后需重启服务
+database:
+  driver: sqlite               # 第一版仅支持 sqlite
+  dsn: ""                      # 留空默认使用 ~/.wing-ai-proxy/sqlite.db
+
+# 日志级别: debug, info, warn, error
+log_level: "info"
