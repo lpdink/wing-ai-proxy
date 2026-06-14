@@ -225,15 +225,15 @@ func (h *Handler) Responses(c *gin.Context) {
 // --- Responses API types ---
 
 type ResponsesRequest struct {
-	Model       string           `json:"model"`
-	Instructions string          `json:"instructions"`
-	Input       []ResponseItem   `json:"input"`
-	Tools       []json.RawMessage `json:"tools"`
-	ToolChoice  string           `json:"tool_choice"`
-	Stream      bool             `json:"stream"`
-	Reasoning   *json.RawMessage `json:"reasoning,omitempty"`
-	Store       bool             `json:"store"`
-	Include     []string         `json:"include"`
+	Model        string            `json:"model"`
+	Instructions string            `json:"instructions"`
+	Input        []ResponseItem    `json:"input"`
+	Tools        []json.RawMessage `json:"tools"`
+	ToolChoice   string            `json:"tool_choice"`
+	Stream       bool              `json:"stream"`
+	Reasoning    *json.RawMessage  `json:"reasoning,omitempty"`
+	Store        bool              `json:"store"`
+	Include      []string          `json:"include"`
 }
 
 type ResponseItem struct {
@@ -246,17 +246,17 @@ type ResponseItem struct {
 	// For function_call
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
-	ID       string `json:"id,omitempty"`
+	ID        string `json:"id,omitempty"`
 }
 
 // --- Chat Completions types ---
 
 type chatCompletionRequest struct {
-	Model    string                   `json:"model"`
-	Messages []chatMessage            `json:"messages"`
-	Tools    []json.RawMessage        `json:"tools,omitempty"`
-	Stream   bool                     `json:"stream"`
-	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
+	Model         string            `json:"model"`
+	Messages      []chatMessage     `json:"messages"`
+	Tools         []json.RawMessage `json:"tools,omitempty"`
+	Stream        bool              `json:"stream"`
+	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
 }
 
 type streamOptions struct {
@@ -264,16 +264,16 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role      string          `json:"role"`
-	Content   json.RawMessage `json:"content,omitempty"`
-	ToolCalls []toolCallMsg   `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	Name      string          `json:"name,omitempty"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content,omitempty"`
+	ToolCalls  []toolCallMsg   `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Name       string          `json:"name,omitempty"`
 }
 
 type toolCallMsg struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
+	ID       string          `json:"id"`
+	Type     string          `json:"type"`
 	Function functionCallMsg `json:"function"`
 }
 
@@ -283,9 +283,9 @@ type functionCallMsg struct {
 }
 
 type chatCompletionChunk struct {
-	ID      string       `json:"id"`
+	ID      string        `json:"id"`
 	Choices []chunkChoice `json:"choices"`
-	Usage   *chatUsage   `json:"usage,omitempty"`
+	Usage   *chatUsage    `json:"usage,omitempty"`
 }
 
 type chunkChoice struct {
@@ -301,10 +301,10 @@ type chunkDelta struct {
 }
 
 type toolCallDelta struct {
-	Index    int              `json:"index"`
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"`
-	Function functionDelta    `json:"function,omitempty"`
+	Index    int           `json:"index"`
+	ID       string        `json:"id,omitempty"`
+	Type     string        `json:"type,omitempty"`
+	Function functionDelta `json:"function,omitempty"`
 }
 
 type functionDelta struct {
@@ -313,9 +313,9 @@ type functionDelta struct {
 }
 
 type chatUsage struct {
-	PromptTokens     int                    `json:"prompt_tokens"`
-	CompletionTokens int                    `json:"completion_tokens"`
-	TotalTokens      int                    `json:"total_tokens"`
+	PromptTokens        int                 `json:"prompt_tokens"`
+	CompletionTokens    int                 `json:"completion_tokens"`
+	TotalTokens         int                 `json:"total_tokens"`
 	PromptTokensDetails promptTokensDetails `json:"prompt_tokens_details"`
 }
 
@@ -521,11 +521,11 @@ func (t *responsesTranslator) emitCreated() {
 
 func (t *responsesTranslator) emitTextDelta(delta string) {
 	t.writeEvent("response.output_text.delta", map[string]interface{}{
-		"type":         "response.output_text.delta",
-		"item_id":      fmt.Sprintf("msg_%d", t.itemIndex),
-		"output_index": t.itemIndex,
+		"type":          "response.output_text.delta",
+		"item_id":       fmt.Sprintf("msg_%d", t.itemIndex),
+		"output_index":  t.itemIndex,
 		"content_index": 0,
-		"delta":        delta,
+		"delta":         delta,
 	})
 }
 
@@ -596,9 +596,9 @@ func (t *responsesTranslator) emitMessageItemDone() {
 		"type":         "response.output_item.done",
 		"output_index": t.itemIndex,
 		"item": map[string]interface{}{
-			"type":    "message",
-			"id":      fmt.Sprintf("msg_%d", t.itemIndex),
-			"role":    "assistant",
+			"type": "message",
+			"id":   fmt.Sprintf("msg_%d", t.itemIndex),
+			"role": "assistant",
 			"content": []map[string]interface{}{
 				{"type": "output_text", "text": ""},
 			},
