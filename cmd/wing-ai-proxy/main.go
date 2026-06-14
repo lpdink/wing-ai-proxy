@@ -94,6 +94,7 @@ func run() error {
 	api.Use(auth.Handler())
 	api.GET("/models", handler.Models)
 	api.POST("/chat/completions", handler.ChatCompletions)
+	api.POST("/v1/responses", handler.Responses)
 
 	// 9. Start config watcher
 	watcher, err := config.NewWatcher(configPath, cfg, func(newCfg *config.Config) {
