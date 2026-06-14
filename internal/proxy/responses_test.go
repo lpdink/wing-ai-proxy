@@ -279,7 +279,7 @@ func TestTranslator_FullLifecycle(t *testing.T) {
 	tr.emitTextDelta("Hi")
 	tr.emitTextDelta(" there")
 	tr.emitTextDone("Hi there")
-	tr.emitMessageItemDone()
+	tr.emitMessageItemDone("Hi there")
 	tr.emitCompleted("Hi there", "", nil, &chatUsage{
 		PromptTokens:     10,
 		CompletionTokens: 5,
@@ -322,14 +322,14 @@ func TestTranslator_ToolCallLifecycle(t *testing.T) {
 	}
 
 	tr.emitToolCallAdded(0, "call_abc", "bash")
-	tr.emitToolCallArgsDelta(0, `{"command":"ls"}`)
+	tr.emitToolCallArgsDelta(0, "call_abc", `{"command":"ls"}`)
 
 	var tc translatedToolCall
 	tc.name = "bash"
 	tc.callID = "call_abc"
 	tc.args.WriteString(`{"command":"ls"}`)
 
-	tr.emitToolCallArgsDone(0, `{"command":"ls"}`)
+	tr.emitToolCallArgsDone(0, tc)
 	tr.emitToolCallItemDone(0, tc)
 
 	output := buf.String()
@@ -429,4 +429,169 @@ func TestResponsesEndpoint(t *testing.T) {
 
 func jsonRaw(s string) json.RawMessage {
 	return json.RawMessage(s)
+}
+
+// --- Additional test cases ---
+
+func TestConvertToChatCompletions_EmptyInput(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:  "test-model",
+		Input:  []ResponseItem{},
+		Stream: true,
+	}
+
+	chat := convertToChatCompletions(req, "test-model")
+
+	if len(chat.Messages) != 0 {
+		t.Errorf("len(messages) = %d, want 0 for empty input", len(chat.Messages))
+	}
+}
+
+func TestConvertToChatCompletions_EmptyInstructionsAndInput(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:        "test-model",
+		Instructions: "",
+		Input:        nil,
+	}
+
+	chat := convertToChatCompletions(req, "test-model")
+
+	if len(chat.Messages) != 0 {
+		t.Errorf("len(messages) = %d, want 0", len(chat.Messages))
+	}
+}
+
+func TestConvertTools_DropsNonFunctionTools(t *testing.T) {
+	tools := []json.RawMessage{
+		jsonRaw(`{"type":"function","name":"bash","description":"Run","parameters":{}}`),
+		jsonRaw(`{"type":"web_search","max_results":5}`),
+	}
+
+	result := convertTools(tools)
+
+	// Only the function tool should be kept
+	if len(result) != 1 {
+		t.Errorf("len(result) = %d, want 1 (web_search should be dropped)", len(result))
+	}
+}
+
+func TestResponsesEndpoint_UpstreamError(t *testing.T) {
+	// Mock upstream that returns 500
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal error"}`))
+	}))
+	defer upstream.Close()
+
+	models := map[string]string{"test-model": "real-model"}
+	cfg := config.ProviderConfig{
+		Name:    "test-provider",
+		Type:    "openai",
+		BaseURL: upstream.URL,
+		APIKey:  "sk-test",
+		Timeout: 30 * time.Second,
+		Models:  models,
+	}
+	p, _ := provider.NewProvider(cfg)
+	reg := provider.NewRegistry([]provider.Provider{p})
+	store, _ := audit.NewSQLiteStore(":memory:")
+	writer := audit.NewAsyncWriter(store, 100)
+	handler := NewHandler(reg, writer)
+	auth := middleware.NewAuth([]string{"sk-valid"})
+
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	api := r.Group("/")
+	api.Use(auth.Handler())
+	api.POST("/v1/responses", handler.Responses)
+
+	reqBody := `{"model":"test-model","input":[{"type":"message","role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer sk-valid")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
+	// Should forward Content-Type from upstream
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestResponsesEndpoint_ModelNotFound(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called")
+	}))
+	defer upstream.Close()
+
+	models := map[string]string{"test-model": "real-model"}
+	cfg := config.ProviderConfig{
+		Name:    "test-provider",
+		Type:    "openai",
+		BaseURL: upstream.URL,
+		APIKey:  "sk-test",
+		Timeout: 30 * time.Second,
+		Models:  models,
+	}
+	p, _ := provider.NewProvider(cfg)
+	reg := provider.NewRegistry([]provider.Provider{p})
+	store, _ := audit.NewSQLiteStore(":memory:")
+	writer := audit.NewAsyncWriter(store, 100)
+	handler := NewHandler(reg, writer)
+	auth := middleware.NewAuth([]string{"sk-valid"})
+
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	api := r.Group("/")
+	api.Use(auth.Handler())
+	api.POST("/v1/responses", handler.Responses)
+
+	reqBody := `{"model":"nonexistent","input":[{"type":"message","role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer sk-valid")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not found") {
+		t.Error("error message should mention model not found")
+	}
+}
+
+func TestConvertToChatCompletions_ToolCallsIncluded(t *testing.T) {
+	tools := []json.RawMessage{
+		jsonRaw(`{"type":"function","name":"bash","description":"Run shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}`),
+	}
+
+	req := &ResponsesRequest{
+		Model: "test-model",
+		Input: []ResponseItem{
+			{Type: "message", Role: "user", Content: jsonRaw(`"run ls"`)},
+		},
+		Tools:      tools,
+		ToolChoice: "auto",
+		Stream:     true,
+	}
+
+	chat := convertToChatCompletions(req, "test-model")
+
+	if len(chat.Tools) != 1 {
+		t.Fatalf("len(tools) = %d, want 1", len(chat.Tools))
+	}
+
+	// Verify tool was wrapped in Chat Completions format
+	var tool map[string]json.RawMessage
+	json.Unmarshal(chat.Tools[0], &tool)
+	if _, ok := tool["function"]; !ok {
+		t.Error("tool missing 'function' wrapper")
+	}
 }

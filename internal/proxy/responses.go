@@ -57,7 +57,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		ModelShowName: req.Model,
 		ModelRealName: realName,
 		RequestStart:  startTime,
-		IsStream:      true, // Responses API is always streamed for codex
+		IsStream:      req.Stream,
 		RequestBody:   string(body),
 	}
 
@@ -87,6 +87,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		auditRecord.RequestEnd = time.Now()
 		h.recordMetrics(&auditRecord, startTime)
 		h.auditWriter.Submit(auditRecord)
+		// 🔴 Fix 4: forward upstream Content-Type
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			c.Header("Content-Type", ct)
+		}
 		c.Status(resp.StatusCode)
 		c.Writer.Write(respBody)
 		return
@@ -158,15 +162,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		choice := chunk.Choices[0]
 		delta := choice.Delta
 
-		// Debug: log each chunk's delta fields
-		logger.Debug("responses chunk",
-			"content_len", len(delta.Content),
-			"reasoning_len", len(delta.ReasoningContent),
-			"tool_calls", len(delta.ToolCalls),
-			"role", delta.Role,
-			"finish", choice.FinishReason,
-		)
-
 		// Handle content text
 		if delta.Content != "" {
 			aggregatedContent.WriteString(delta.Content)
@@ -191,7 +186,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if tc.Function.Arguments != "" {
 				toolCalls[idx].args.WriteString(tc.Function.Arguments)
-				translator.emitToolCallArgsDelta(idx, tc.Function.Arguments)
+				translator.emitToolCallArgsDelta(idx, toolCalls[idx].callID, tc.Function.Arguments)
 			}
 		}
 	}
@@ -232,8 +227,6 @@ type ResponsesRequest struct {
 	ToolChoice   string            `json:"tool_choice"`
 	Stream       bool              `json:"stream"`
 	Reasoning    *json.RawMessage  `json:"reasoning,omitempty"`
-	Store        bool              `json:"store"`
-	Include      []string          `json:"include"`
 }
 
 type ResponseItem struct {
@@ -420,6 +413,8 @@ func normalizeContent(raw json.RawMessage) json.RawMessage {
 		for _, p := range parts {
 			if p.Type == "output_text" || p.Type == "text" || p.Type == "input_text" {
 				sb.WriteString(p.Text)
+			} else {
+				slog.Warn("normalizeContent: dropping non-text content part", "type", p.Type)
 			}
 		}
 		b, _ := json.Marshal(sb.String())
@@ -451,8 +446,7 @@ func convertTools(tools []json.RawMessage) []json.RawMessage {
 				continue
 			}
 
-			// Wrap Responses API format into Chat Completions format:
-			// Extract name, description, parameters and nest under "function"
+			// Wrap Responses API format into Chat Completions format
 			fnDef := make(map[string]json.RawMessage)
 			for _, key := range []string{"name", "description", "parameters", "strict"} {
 				if v, ok := tool[key]; ok {
@@ -473,6 +467,8 @@ func convertTools(tools []json.RawMessage) []json.RawMessage {
 				continue
 			}
 			result = append(result, wrappedBytes)
+		} else {
+			slog.Warn("convertTools: dropping non-function tool", "type", typeStr)
 		}
 	}
 	return result
@@ -544,12 +540,12 @@ func (t *responsesTranslator) emitToolCallAdded(idx int, callID, name string) {
 	})
 }
 
-func (t *responsesTranslator) emitToolCallArgsDelta(idx int, delta string) {
+func (t *responsesTranslator) emitToolCallArgsDelta(idx int, callID, delta string) {
 	t.writeEvent("response.function_call_arguments.delta", map[string]interface{}{
 		"type":         "response.function_call_arguments.delta",
 		"item_id":      fmt.Sprintf("fc_%d", idx),
 		"output_index": t.itemIndex + 1 + idx,
-		"call_id":      "",
+		"call_id":      callID,
 		"delta":        delta,
 	})
 }
@@ -591,7 +587,7 @@ func (t *responsesTranslator) emitTextDone(content string) {
 	})
 }
 
-func (t *responsesTranslator) emitMessageItemDone() {
+func (t *responsesTranslator) emitMessageItemDone(content string) {
 	t.writeEvent("response.output_item.done", map[string]interface{}{
 		"type":         "response.output_item.done",
 		"output_index": t.itemIndex,
@@ -600,20 +596,20 @@ func (t *responsesTranslator) emitMessageItemDone() {
 			"id":   fmt.Sprintf("msg_%d", t.itemIndex),
 			"role": "assistant",
 			"content": []map[string]interface{}{
-				{"type": "output_text", "text": ""},
+				{"type": "output_text", "text": content},
 			},
 			"status": "completed",
 		},
 	})
 }
 
-func (t *responsesTranslator) emitToolCallArgsDone(idx int, args string) {
+func (t *responsesTranslator) emitToolCallArgsDone(idx int, tc translatedToolCall) {
 	t.writeEvent("response.function_call_arguments.done", map[string]interface{}{
 		"type":         "response.function_call_arguments.done",
 		"item_id":      fmt.Sprintf("fc_%d", idx),
 		"output_index": t.itemIndex + 1 + idx,
-		"call_id":      "",
-		"arguments":    args,
+		"call_id":      tc.callID,
+		"arguments":    tc.args.String(),
 	})
 }
 
@@ -636,12 +632,12 @@ func (t *responsesTranslator) emitCompleted(content, reasoning string, toolCalls
 	// Emit text done and item done if there was content
 	if content != "" || reasoning != "" {
 		t.emitTextDone(content)
-		t.emitMessageItemDone()
+		t.emitMessageItemDone(content)
 	}
 
 	// Emit tool call done events
 	for i, tc := range toolCalls {
-		t.emitToolCallArgsDone(i, tc.args.String())
+		t.emitToolCallArgsDone(i, tc)
 		t.emitToolCallItemDone(i, tc)
 	}
 
