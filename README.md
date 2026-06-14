@@ -5,6 +5,7 @@
 ## 特性
 
 - **OpenAI 兼容协议** — `/models`、`/chat/completions`（流式 SSE + 非流式）
+- **Responses API 桥接** — `/v1/responses` 将 OpenAI Responses API 自动转换为 Chat Completions 转发上游，兼容 Codex CLI 等工具
 - **多 Provider 路由** — 支持多个上游（DashScope、OpenAI 等），模型别名映射
 - **全量审计** — 异步写入 SQLite，记录请求/响应体、token 用量、首包延迟
 - **配置热加载** — 修改 YAML 配置自动生效，无需重启
@@ -97,6 +98,38 @@ response = client.chat.completions.create(
 | `/metrics` | GET | ❌ | Prometheus 指标 |
 | `/models` | GET | ✅ | 返回可用模型列表 |
 | `/chat/completions` | POST | ✅ | OpenAI 兼容聊天接口 |
+| `/v1/chat/completions` | POST | ✅ | 同上（带 /v1 前缀的别名） |
+| `/v1/responses` | POST | ✅ | OpenAI Responses API 桥接 |
+
+### Responses API（`/v1/responses`）
+
+桥接 OpenAI Responses API 到上游 Chat Completions，使 Codex CLI 等工具无需上游原生支持即可使用。
+
+**协议转换**：
+- 请求：`instructions` → system message，`input` → messages，`developer` role → `system`
+- 工具：Responses API 扁平格式自动包装为 Chat Completions 的 `function` 嵌套格式
+- 响应：Chat Completions SSE 流转换为完整的 Responses API 事件生命周期
+
+**使用示例（Codex CLI）**：
+
+在 `~/.codex/config.toml` 中配置自定义 provider：
+
+```toml
+model = "qwen3.7-max"
+model_provider = "wing"
+
+[model_providers.wing]
+name = "Wing AI Proxy"
+base_url = "http://127.0.0.1:39998/v1"
+env_key = "WING_API_KEY"
+wire_api = "responses"
+```
+
+然后设置环境变量并启动：
+
+```bash
+WING_API_KEY="sk-your-virtual-key" codex
+```
 
 ## 配置详解
 
@@ -181,7 +214,9 @@ wing-ai-proxy/
 │   ├── metrics/                 # Prometheus 指标定义
 │   ├── middleware/               # RequestID + Auth 中间件
 │   ├── provider/                # Provider 接口 + OpenAI 实现 + Registry
-│   └── proxy/                   # HTTP Handler（/models, /chat/completions）
+│   └── proxy/                   # HTTP Handler
+│       ├── handler.go           # /models, /chat/completions
+│       └── responses.go         # /v1/responses (Responses API → Chat Completions 桥接)
 ├── migrations/                  # SQLite Schema
 ├── config.example.yaml          # 示例配置
 └── Makefile
