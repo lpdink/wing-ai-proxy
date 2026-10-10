@@ -302,3 +302,114 @@ func TestCompact_ConcurrentWrites(t *testing.T) {
 		t.Errorf("%d legacy text bodies remain after concurrent compact", remaining)
 	}
 }
+
+func TestSelectCompactBatch_ByteBudget(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir + "/budget.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const bodySize = 100
+	body := strings.Repeat("a", bodySize)
+	for i := 0; i < 10; i++ {
+		insertLegacyRow(t, store, fmt.Sprintf("budget-%02d", i), body, "")
+	}
+
+	var maxID int64
+	if err := store.db.QueryRow("SELECT MAX(id) FROM audit_records").Scan(&maxID); err != nil {
+		t.Fatal(err)
+	}
+
+	// maxBytes fits three 100-byte rows plus a little slack.
+	ids, err := selectCompactBatch(store.db, 0, maxID, 500, 350)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("batch size = %d, want 3 (byte budget)", len(ids))
+	}
+
+	// The cursor must resume past the previous batch instead of re-scanning.
+	ids2, err := selectCompactBatch(store.db, ids[len(ids)-1], maxID, 500, 350)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids2) != 3 {
+		t.Errorf("second batch size = %d, want 3", len(ids2))
+	}
+	if len(ids2) > 0 && ids2[0] <= ids[len(ids)-1] {
+		t.Errorf("cursor did not advance: first id %d <= previous last %d", ids2[0], ids[len(ids)-1])
+	}
+}
+
+func TestCompact_ConcurrentLegacyWrites(t *testing.T) {
+	dir := t.TempDir()
+	dsn := dir + "/legacy-concurrent.db"
+	store, err := NewSQLiteStore(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	body := `{"messages":[{"role":"user","content":"legacy row written by an old proxy"}]}`
+	const initialRows = 40
+	for i := 0; i < initialRows; i++ {
+		insertLegacyRow(t, store, fmt.Sprintf("old-%03d", i), body, body)
+	}
+
+	// An old proxy version keeps appending plain-TEXT rows while compact runs.
+	// Inject them between batches (the progress callback fires outside the
+	// write transaction), i.e. after the max-id snapshot was taken.
+	const lateRows = 5
+	var injected bool
+	result, err := Compact(dsn, CompactOptions{
+		BatchSize: 10,
+		Progress: func(CompactStats) {
+			if injected {
+				return
+			}
+			injected = true
+			for i := 0; i < lateRows; i++ {
+				insertLegacyRow(t, store, fmt.Sprintf("late-%03d", i), body, body)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if result.RowsProcessed != initialRows {
+		t.Errorf("rows processed = %d, want %d (snapshot rows only)", result.RowsProcessed, initialRows)
+	}
+
+	// Rows appended after the snapshot are left untouched for the next run.
+	if got := countLegacyTextRows(t, store); got != lateRows {
+		t.Errorf("legacy rows remaining = %d, want %d", got, lateRows)
+	}
+
+	// A second run picks them up.
+	second, err := Compact(dsn, CompactOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RowsProcessed != lateRows {
+		t.Errorf("second run rows = %d, want %d", second.RowsProcessed, lateRows)
+	}
+	if got := countLegacyTextRows(t, store); got != 0 {
+		t.Errorf("legacy rows remaining after second run = %d, want 0", got)
+	}
+}
+
+func countLegacyTextRows(t *testing.T, store *SQLiteStore) int {
+	t.Helper()
+	var n int
+	err := store.db.QueryRow(`
+		SELECT COUNT(*) FROM audit_records
+		WHERE (typeof(request_body) = 'text' AND request_body <> '')
+		   OR (typeof(response_body) = 'text' AND response_body <> '')`).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}

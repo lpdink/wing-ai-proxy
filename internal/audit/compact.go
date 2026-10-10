@@ -11,6 +11,11 @@ import (
 // defaultCompactBatchSize is the number of rows compressed per transaction.
 const defaultCompactBatchSize = 500
 
+// defaultCompactBatchBytes bounds the cumulative legacy body bytes compressed
+// per transaction, keeping the write lock hold time short even when rows carry
+// near-10MB bodies.
+const defaultCompactBatchBytes = 32 << 20 // 32MB
+
 // CompactStats reports cumulative progress of a compaction run.
 type CompactStats struct {
 	RowsProcessed int64
@@ -22,6 +27,8 @@ type CompactStats struct {
 type CompactOptions struct {
 	// BatchSize is the number of rows compressed per transaction (default 500).
 	BatchSize int
+	// BatchBytes caps the cumulative body bytes per transaction (default 32MB).
+	BatchBytes int64
 	// Vacuum runs VACUUM after compaction and reports the reclaimed bytes.
 	Vacuum bool
 	// Progress, if set, is called after each committed batch with cumulative stats.
@@ -52,6 +59,10 @@ func Compact(dsn string, opts CompactOptions) (CompactResult, error) {
 	batchSize := opts.BatchSize
 	if batchSize <= 0 {
 		batchSize = defaultCompactBatchSize
+	}
+	batchBytes := opts.BatchBytes
+	if batchBytes <= 0 {
+		batchBytes = defaultCompactBatchBytes
 	}
 
 	// A mistyped path must fail instead of silently creating an empty database.
@@ -84,14 +95,16 @@ func Compact(dsn string, opts CompactOptions) (CompactResult, error) {
 		return result, fmt.Errorf("audit: compact: max id: %w", err)
 	}
 
+	lastID := int64(0)
 	for {
-		ids, err := selectCompactBatch(db, maxID, batchSize)
+		ids, err := selectCompactBatch(db, lastID, maxID, batchSize, batchBytes)
 		if err != nil {
 			return result, err
 		}
 		if len(ids) == 0 {
 			break
 		}
+		lastID = ids[len(ids)-1]
 
 		tx, err := db.Begin()
 		if err != nil {
@@ -134,30 +147,39 @@ func Compact(dsn string, opts CompactOptions) (CompactResult, error) {
 }
 
 // selectCompactBatch returns the ids of the next batch of rows that still hold
-// legacy plain-TEXT bodies. Processed rows no longer match the typeof()
-// predicates, so the same query can be repeated without an OFFSET.
-func selectCompactBatch(db *sql.DB, maxID int64, limit int) ([]int64, error) {
+// legacy plain-TEXT bodies, starting after lastID. Processed rows no longer
+// match the typeof() predicates, and the id cursor keeps the total work linear
+// in the number of rows (no re-scanning of earlier batches). The batch is
+// capped by both row count and cumulative body bytes so that the write
+// transaction stays short even with very large legacy rows.
+func selectCompactBatch(db *sql.DB, lastID, maxID int64, limit int, maxBytes int64) ([]int64, error) {
 	const query = `
-		SELECT id FROM audit_records
-		WHERE id <= ?
+		SELECT id, length(CAST(request_body AS BLOB)) + length(CAST(response_body AS BLOB))
+		FROM audit_records
+		WHERE id > ? AND id <= ?
 		  AND ((typeof(request_body) = 'text' AND request_body <> '')
 		    OR (typeof(response_body) = 'text' AND response_body <> ''))
 		ORDER BY id
 		LIMIT ?`
 
-	rows, err := db.Query(query, maxID, limit)
+	rows, err := db.Query(query, lastID, maxID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("audit: compact: select batch: %w", err)
 	}
 	defer rows.Close()
 
 	var ids []int64
+	var totalBytes int64
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var id, size int64
+		if err := rows.Scan(&id, &size); err != nil {
 			return nil, fmt.Errorf("audit: compact: scan batch id: %w", err)
 		}
+		if len(ids) > 0 && totalBytes+size > maxBytes {
+			break // keep the rows selected so far; the rest goes to the next batch
+		}
 		ids = append(ids, id)
+		totalBytes += size
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("audit: compact: iterate batch: %w", err)
@@ -227,19 +249,50 @@ func compressLegacyBody(body []byte, bodyType string) (compressed []byte, inputB
 }
 
 // vacuum checkpoints the WAL and runs VACUUM, returning the number of bytes
-// reclaimed in the main database file.
+// reclaimed in the database footprint (main file + WAL). VACUUM requires a
+// quiet database: when a concurrent reader keeps the WAL open, checkpointing
+// reports busy and the caller is asked to retry when the proxy is idle.
 func vacuum(db *sql.DB, dsn string) (int64, error) {
-	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		return 0, fmt.Errorf("wal checkpoint: %w", err)
+	if err := checkpoint(db); err != nil {
+		return 0, err
 	}
-	before := fileSize(dsn)
+	path := dsnPath(dsn)
+	before := dbFootprint(path)
 	if _, err := db.Exec("VACUUM"); err != nil {
 		return 0, err
 	}
-	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		return 0, fmt.Errorf("wal checkpoint after vacuum: %w", err)
+	if err := checkpoint(db); err != nil {
+		return 0, err
 	}
-	return before - fileSize(dsn), nil
+	return before - dbFootprint(path), nil
+}
+
+// checkpoint runs a TRUNCATE WAL checkpoint and fails when it cannot complete
+// because of concurrent readers.
+func checkpoint(db *sql.DB) error {
+	var busy, logFrames, checkpointed int
+	if err := db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("wal checkpoint: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("wal checkpoint is busy (concurrent readers); retry when the proxy is idle")
+	}
+	return nil
+}
+
+// dsnPath extracts the filesystem path from a SQLite DSN ("file:" prefix and
+// query parameters are stripped), so file sizes can be measured on disk.
+func dsnPath(dsn string) string {
+	path := strings.TrimPrefix(dsn, "file:")
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	return path
+}
+
+// dbFootprint reports the on-disk size of the database (main file + WAL).
+func dbFootprint(path string) int64 {
+	return fileSize(path) + fileSize(path+"-wal")
 }
 
 func fileSize(path string) int64 {

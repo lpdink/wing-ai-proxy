@@ -219,6 +219,12 @@ func (h *Handler) handleStream(
 
 	// Get the aggregated response message and usage for audit
 	respBody, inputTok, outputTok, cacheHit, toolCalls := forwarder.Aggregator().Result()
+	if resp.StatusCode != http.StatusOK || !forwarder.Aggregator().SawEvent() {
+		// The upstream body was not a valid SSE stream (e.g. a JSON error
+		// payload or an HTML error page): store the raw bytes so the audit
+		// trail shows why the request failed instead of an empty aggregate.
+		respBody = string(forwarder.Raw())
+	}
 	ar.ResponseBody = respBody
 	ar.InputTokens = inputTok
 	ar.OutputTokens = outputTok
@@ -232,6 +238,7 @@ func (h *Handler) handleStream(
 		"duration_ms", ar.RequestEnd.Sub(ar.RequestStart).Milliseconds(),
 		"input_tokens", inputTok,
 		"output_tokens", outputTok,
+		"response_body_bytes", len(respBody),
 	)
 }
 

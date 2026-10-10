@@ -8,19 +8,31 @@ import (
 	"strings"
 )
 
+// maxPendingLineSize bounds the bytes kept for a single partial SSE line.
+// Real events are small; a line that grows beyond this without a newline
+// signals upstream misbehavior, and the partial line is dropped to keep the
+// aggregator's memory bounded.
+const maxPendingLineSize = 16 << 20 // 16MB
+
 // SSEAggregator collects SSE chunks and assembles the aggregated response
-// message for audit. The raw SSE stream is never stored: only content,
+// message for audit. The raw SSE stream is not stored: only content,
 // reasoning content, tool calls, finish reason and usage are retained and
 // rendered as a compact JSON document by Result. Multiple upstream choices
 // (n > 1) are merged into a single message, which is a known limitation.
 type SSEAggregator struct {
-	// carry holds the trailing bytes of a line split across chunks.
-	carry        []byte
+	// pending buffers bytes that have not yet formed a complete line: a line
+	// split across chunks is parsed once its remainder arrives. A bytes.Buffer
+	// keeps appends amortized (O(total)) instead of re-allocating per chunk.
+	pending      bytes.Buffer
 	content      strings.Builder
 	reasoning    strings.Builder
 	toolCalls    map[int]*toolCallAccum
 	finishReason string
 	usage        *usageInfo
+	// sawData records whether at least one SSE data line was seen. Handlers
+	// use it to detect non-SSE upstream bodies (JSON error payloads, HTML
+	// error pages) and fall back to storing the raw bytes.
+	sawData bool
 }
 
 type toolCallAccum struct {
@@ -50,16 +62,23 @@ func NewSSEAggregator() *SSEAggregator {
 // boundaries are arbitrary: a line split across chunks is carried over and
 // parsed once its remainder arrives.
 func (a *SSEAggregator) ProcessChunk(data []byte) {
-	a.carry = append(a.carry, data...)
+	a.pending.Write(data)
+	a.drainLines()
+	if a.pending.Len() > maxPendingLineSize {
+		a.pending.Reset()
+	}
+}
 
+// drainLines parses every complete line currently buffered.
+func (a *SSEAggregator) drainLines() {
 	for {
-		idx := bytes.IndexByte(a.carry, '\n')
+		buf := a.pending.Bytes()
+		idx := bytes.IndexByte(buf, '\n')
 		if idx < 0 {
 			return
 		}
-		line := a.carry[:idx]
-		a.carry = a.carry[idx+1:]
-		a.processLine(line)
+		a.processLine(buf[:idx])
+		a.pending.Next(idx + 1) // consume the line without copying
 	}
 }
 
@@ -72,6 +91,7 @@ func (a *SSEAggregator) processLine(line []byte) {
 	if !bytes.HasPrefix(line, []byte("data:")) {
 		return
 	}
+	a.sawData = true
 	payload := bytes.TrimSpace(line[len("data:"):])
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 		return
@@ -119,12 +139,19 @@ func (a *SSEAggregator) processLine(line []byte) {
 
 // finish parses a possible trailing line that was not terminated by a newline.
 func (a *SSEAggregator) finish() {
-	if len(a.carry) == 0 {
+	if a.pending.Len() == 0 {
 		return
 	}
-	line := a.carry
-	a.carry = nil
-	a.processLine(line)
+	a.processLine(a.pending.Bytes())
+	a.pending.Reset()
+}
+
+// SawEvent reports whether the stream contained at least one SSE data line.
+// When it did not, the upstream body was not an SSE stream at all (a JSON
+// error payload, an HTML error page, ...) and callers should fall back to
+// storing the raw bytes instead of an empty aggregate.
+func (a *SSEAggregator) SawEvent() bool {
+	return a.sawData
 }
 
 // Result returns the aggregated response body as JSON, plus token usage and
@@ -231,13 +258,21 @@ type sseFunction struct {
 	Arguments string `json:"arguments"`
 }
 
+// maxRawFallbackSize bounds the leading raw bytes of the upstream body kept
+// for the non-SSE fallback (error payloads, HTML error pages). SSE streams
+// are aggregated and never stored raw.
+const maxRawFallbackSize = 1 << 20 // 1MB
+
 // StreamForwarder wraps an upstream response body, forwarding each byte
-// to the client writer while simultaneously feeding the aggregator.
+// to the client writer while simultaneously feeding the aggregator. It also
+// keeps the leading upstream bytes (up to maxRawFallbackSize) so that callers
+// can store the raw body when the response turns out not to be an SSE stream.
 type StreamForwarder struct {
 	upstream   io.Reader
 	client     io.Writer
 	aggregator *SSEAggregator
 	flusher    interface{ Flush() }
+	raw        []byte
 }
 
 // NewStreamForwarder creates a new stream forwarder.
@@ -255,6 +290,13 @@ func (sf *StreamForwarder) Aggregator() *SSEAggregator {
 	return sf.aggregator
 }
 
+// Raw returns the leading bytes of the upstream body (up to
+// maxRawFallbackSize). Callers use it as the audit fallback when the response
+// was not an SSE stream.
+func (sf *StreamForwarder) Raw() []byte {
+	return sf.raw
+}
+
 // Run reads from upstream, forwards to client, and aggregates.
 // Returns when upstream is exhausted or an error occurs.
 func (sf *StreamForwarder) Run() error {
@@ -264,6 +306,14 @@ func (sf *StreamForwarder) Run() error {
 		n, err := sf.upstream.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
+
+			// Keep the leading bytes for the non-SSE audit fallback.
+			if remaining := maxRawFallbackSize - len(sf.raw); remaining > 0 {
+				if remaining > len(chunk) {
+					remaining = len(chunk)
+				}
+				sf.raw = append(sf.raw, chunk[:remaining]...)
+			}
 
 			// Forward to client immediately
 			if _, werr := sf.client.Write(chunk); werr != nil {

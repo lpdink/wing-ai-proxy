@@ -34,7 +34,9 @@ func gzipEncode(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// gzipDecode decompresses gzip-encoded data.
+// gzipDecode decompresses gzip-encoded data. The store itself only writes
+// bodies (operators read them back out of band with standard tools), so this
+// helper is currently exercised by tests only.
 func gzipDecode(data []byte) ([]byte, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {

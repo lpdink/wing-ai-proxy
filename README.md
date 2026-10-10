@@ -188,12 +188,14 @@ GROUP BY tool_name ORDER BY call_count DESC;
 
 ### 审计存储格式
 
-- `request_body` / `response_body`：非空内容以 **gzip 压缩后的 BLOB** 存储；空内容仍为空字符串。
-- 流式请求的 `response_body` 保存**聚合后的 JSON**（不再保存原始 SSE 流），形如：
+- `request_body` / `response_body`：非空内容以 **gzip 压缩后的 BLOB** 存储；空内容仍为空字符串。（提示：几十字节级的极小 body 经 gzip 后可能略大于原文，固定开销约 25 字节，量级可忽略。）
+- 流式请求（`/chat/completions`）的 `response_body` 保存**聚合后的 JSON**（不再保存原始 SSE 流），形如：
   ```json
   {"content":"...","reasoning_content":"...","tool_calls":[{"id":"...","name":"...","arguments":"..."}],"finish_reason":"stop","usage":{"prompt_tokens":0,"completion_tokens":0,"cached_tokens":0}}
   ```
   已知限制：上游 `n > 1` 的多个 choice 会合并为单条 message（本网关非目标场景）。
+- 非 SSE 响应（如上游错误 JSON、HTML 错误页）：流式请求的 `response_body` 保存**原始响应字节（最多前 1MB）**，避免审计里只剩空聚合体、看不到失败原因。
+- 已知差异：`/v1/responses` 的流式审计保存聚合后的纯文本 content（不做 JSON 包装），与 `/chat/completions` 的聚合 JSON 形态不同。
 - `truncated` 列仅为兼容历史数据保留，新写入恒为 0。
 - 升级前写入的历史行仍是明文 TEXT。可用 `typeof(request_body)` 区分：`'text'` = 明文（或空串），`'blob'` = 已压缩；执行一次 `compact`（见下）可把历史数据全部压缩。
 
@@ -214,7 +216,7 @@ print(gzip.decompress(body).decode() if isinstance(body, bytes) else body)
 
 ### 审计库维护（compact 子命令）
 
-升级后建议执行一次 `compact`，把历史明文的请求/响应体压缩回写。可在服务运行中执行：分批（每批 500 行）+ 每批一个事务，仅处理 `typeof(...) = 'text'` 的历史行，不会影响正在写入的新数据。
+升级后建议执行一次 `compact`，把历史明文的请求/响应体压缩回写。可在服务运行中执行：分批（每批 500 行、累计 body 上限 32MB）+ 每批一个事务，仅处理 `typeof(...) = 'text'` 的历史行，不会影响正在写入的新数据。
 
 ```bash
 ./bin/wing-ai-proxy compact                      # 使用默认配置路径
@@ -223,7 +225,7 @@ print(gzip.decompress(body).decode() if isinstance(body, bytes) else body)
 ```
 
 - 逐批打印进度（已处理行数、输入/输出字节累计）。
-- 默认不回收磁盘空间，结束时提示可加 `--vacuum`；`VACUUM` 需要相当于库文件大小的临时磁盘空间，建议在业务低峰期执行。
+- 默认不回收磁盘空间，结束时提示可加 `--vacuum`；`VACUUM` 需要相当于库文件大小的临时磁盘空间，且需要数据库空闲——若 WAL checkpoint 因并发读者无法完成（busy），会提示先在业务低峰期重试。
 - 已知限制：历史流式响应体压缩后仍是原始 SSE 文本，不会重新聚合。
 
 ## 开发

@@ -44,9 +44,13 @@
 - **WHEN** 上游返回 100 个 SSE chunk
 - **THEN** 系统将每个 chunk 的 `choices[].delta` 合并为完整的 `choices[].message`，最终聚合结果包含完整的 assistant 回复内容
 
-#### Scenario: 超长响应截断
-- **WHEN** 聚合 buffer 超过配置的上限（默认 10MB）
-- **THEN** 系统截断 `response_body` 并标记 `truncated: true`，防止 OOM
+#### Scenario: 聚合内容完整保留
+- **WHEN** 流式响应的聚合内容（content / reasoning_content 等）超过任意体积
+- **THEN** 系统完整保留聚合结果，不再按固定上限截断；`truncated` 列为兼容历史数据保留，新写入恒为 0（聚合体量本身以单条记录的磁盘占用为界，属有意取舍）
+
+#### Scenario: 非 SSE 响应体兜底保存
+- **WHEN** 上游对流式请求返回非 SSE 响应（如 JSON 错误体、HTML 错误页），或流中不含任何 `data:` 事件
+- **THEN** 系统在 `response_body` 中保存原始响应字节（最多前 1MB），而不是空聚合体，保证审计可解释失败原因
 
 #### Scenario: Tool calls 提取
 - **WHEN** 流式响应中包含 tool_calls（分散在多个 chunk 中）

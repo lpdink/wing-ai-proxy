@@ -497,6 +497,81 @@ func TestStreamForwarder_SplitAcrossReadBuffer(t *testing.T) {
 	}
 }
 
+func TestSSEAggregator_SawEvent(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"json error payload", `{"error":{"message":"Invalid API key","type":"invalid_request_error"}}`, false},
+		{"html error page", "<html><body>502 Bad Gateway</body></html>", false},
+		{"plain text", "rate limited", false},
+		{"sse stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n", true},
+		{"sse done only", "data: [DONE]\n\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := NewSSEAggregator()
+			agg.ProcessChunk([]byte(tc.body))
+			agg.Result() // flushes a trailing line without a newline
+			if got := agg.SawEvent(); got != tc.want {
+				t.Errorf("SawEvent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSSEAggregator_PendingLineCap(t *testing.T) {
+	agg := NewSSEAggregator()
+
+	// A single line growing past the cap without a newline is dropped so the
+	// aggregator's memory stays bounded.
+	chunk := bytes.Repeat([]byte("x"), 1<<20)
+	for i := 0; i < 17; i++ {
+		agg.ProcessChunk(chunk)
+	}
+	if agg.pending.Len() != 0 {
+		t.Errorf("pending len = %d, want 0 (line dropped past cap)", agg.pending.Len())
+	}
+
+	// The aggregator stays usable for subsequent well-formed events.
+	agg.ProcessChunk([]byte(`data: {"choices":[{"index":0,"delta":{"content":"after-cap"}}]}` + "\n\n"))
+	agg.Result()
+	if !strings.Contains(agg.content.String(), "after-cap") {
+		t.Error("aggregator did not recover after dropping an oversized line")
+	}
+}
+
+func TestStreamForwarder_RawFallbackCapture(t *testing.T) {
+	// Non-SSE bodies are captured verbatim for the audit fallback.
+	body := []byte(`{"error":{"message":"upstream overloaded","code":529}}`)
+	var client bytes.Buffer
+	sf := NewStreamForwarder(bytes.NewReader(body), &client, nil)
+	if err := sf.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(sf.Raw()); got != string(body) {
+		t.Errorf("Raw() = %q, want %q", got, body)
+	}
+	if sf.Aggregator().SawEvent() {
+		t.Error("SawEvent() = true for a non-SSE body")
+	}
+	if client.String() != string(body) {
+		t.Error("client did not receive the full body")
+	}
+
+	// Oversized bodies are capped at maxRawFallbackSize.
+	big := bytes.Repeat([]byte("x"), maxRawFallbackSize+4096)
+	var sink bytes.Buffer
+	sf = NewStreamForwarder(bytes.NewReader(big), &sink, nil)
+	if err := sf.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sf.Raw()) != maxRawFallbackSize {
+		t.Errorf("len(Raw()) = %d, want %d", len(sf.Raw()), maxRawFallbackSize)
+	}
+}
+
 // --- Mock store for testing ---
 
 type mockStore struct {
