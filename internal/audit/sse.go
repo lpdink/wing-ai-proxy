@@ -1,29 +1,30 @@
 package audit
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 )
 
-const maxResponseBodySize = 10 * 1024 * 1024 // 10MB
-
-// SSEAggregator collects SSE chunks and assembles a complete response for audit.
+// SSEAggregator collects SSE chunks and assembles the aggregated response
+// message for audit. The raw SSE stream is never stored: only content,
+// reasoning content, tool calls, finish reason and usage are retained and
+// rendered as a compact JSON document by Result. Multiple upstream choices
+// (n > 1) are merged into a single message, which is a known limitation.
 type SSEAggregator struct {
-	buf         bytes.Buffer
-	content     strings.Builder
-	toolCalls   map[int]*toolCallAccum
-	usage       *usageInfo
-	truncated   bool
-	statusCode  int
-	firstByteAt bool
+	// carry holds the trailing bytes of a line split across chunks.
+	carry        []byte
+	content      strings.Builder
+	reasoning    strings.Builder
+	toolCalls    map[int]*toolCallAccum
+	finishReason string
+	usage        *usageInfo
 }
 
 type toolCallAccum struct {
 	ID      string
-	Type    string
 	Name    string
 	ArgsBuf strings.Builder
 }
@@ -45,74 +46,92 @@ func NewSSEAggregator() *SSEAggregator {
 	}
 }
 
-// ProcessChunk reads an SSE event data line and extracts content for aggregation.
-// It also writes the raw chunk to the internal buffer for raw storage.
+// ProcessChunk feeds a chunk of raw upstream bytes to the aggregator. Chunk
+// boundaries are arbitrary: a line split across chunks is carried over and
+// parsed once its remainder arrives.
 func (a *SSEAggregator) ProcessChunk(data []byte) {
-	// Accumulate raw data (with truncation guard)
-	if a.buf.Len()+len(data) <= maxResponseBodySize {
-		a.buf.Write(data)
-	} else if !a.truncated {
-		a.truncated = true
+	a.carry = append(a.carry, data...)
+
+	for {
+		idx := bytes.IndexByte(a.carry, '\n')
+		if idx < 0 {
+			return
+		}
+		line := a.carry[:idx]
+		a.carry = a.carry[idx+1:]
+		a.processLine(line)
+	}
+}
+
+// processLine parses a single SSE line. Non-data lines and malformed payloads
+// are ignored.
+func (a *SSEAggregator) processLine(line []byte) {
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return
 	}
 
-	// Parse SSE events from data
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
-			continue
-		}
+	var chunk sseChunk
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return
+	}
 
-		var chunk sseChunk
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue
+	if chunk.Usage != nil {
+		a.usage = chunk.Usage
+	}
+
+	for _, choice := range chunk.Choices {
+		if choice.FinishReason != "" {
+			a.finishReason = choice.FinishReason
 		}
 
-		// Extract usage (often in the last chunk)
-		if chunk.Usage != nil {
-			a.usage = chunk.Usage
+		if choice.Delta.Content != "" {
+			a.content.WriteString(choice.Delta.Content)
+		}
+		if choice.Delta.ReasoningContent != "" {
+			a.reasoning.WriteString(choice.Delta.ReasoningContent)
 		}
 
-		// Merge choices
-		for _, choice := range chunk.Choices {
-			delta := choice.Delta
-
-			// Accumulate content
-			if delta.Content != "" {
-				a.content.WriteString(delta.Content)
+		for _, tc := range choice.Delta.ToolCalls {
+			acc, ok := a.toolCalls[tc.Index]
+			if !ok {
+				acc = &toolCallAccum{}
+				a.toolCalls[tc.Index] = acc
 			}
-
-			// Accumulate tool calls
-			for _, tc := range delta.ToolCalls {
-				idx := tc.Index
-				acc, ok := a.toolCalls[idx]
-				if !ok {
-					acc = &toolCallAccum{
-						ID:   tc.ID,
-						Type: tc.Type,
-						Name: tc.Function.Name,
-					}
-					a.toolCalls[idx] = acc
-				}
-				if tc.Function.Name != "" && acc.Name == "" {
-					acc.Name = tc.Function.Name
-				}
-				if tc.Function.Arguments != "" {
-					acc.ArgsBuf.WriteString(tc.Function.Arguments)
-				}
+			if acc.ID == "" {
+				acc.ID = tc.ID
+			}
+			if acc.Name == "" {
+				acc.Name = tc.Function.Name
+			}
+			if tc.Function.Arguments != "" {
+				acc.ArgsBuf.WriteString(tc.Function.Arguments)
 			}
 		}
 	}
 }
 
-// Result returns the aggregated response body and metadata.
-func (a *SSEAggregator) Result() (responseBody string, truncated bool, inputTokens, outputTokens, cacheHitTokens int, toolCallNames []string) {
-	responseBody = a.buf.String()
-	truncated = a.truncated
+// finish parses a possible trailing line that was not terminated by a newline.
+func (a *SSEAggregator) finish() {
+	if len(a.carry) == 0 {
+		return
+	}
+	line := a.carry
+	a.carry = nil
+	a.processLine(line)
+}
+
+// Result returns the aggregated response body as JSON, plus token usage and
+// the names of the tool calls seen in the stream. It must only be called after
+// the stream has been fully processed.
+func (a *SSEAggregator) Result() (responseBody string, inputTokens, outputTokens, cacheHitTokens int, toolCallNames []string) {
+	a.finish()
 
 	if a.usage != nil {
 		inputTokens = a.usage.PromptTokens
@@ -122,15 +141,63 @@ func (a *SSEAggregator) Result() (responseBody string, truncated bool, inputToke
 		}
 	}
 
-	// Collect tool call names
-	names := make([]string, 0, len(a.toolCalls))
-	for _, acc := range a.toolCalls {
+	indexes := make([]int, 0, len(a.toolCalls))
+	for idx := range a.toolCalls {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+
+	toolCalls := make([]aggregatedToolCall, 0, len(indexes))
+	toolCallNames = make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		acc := a.toolCalls[idx]
 		if acc.Name != "" {
-			names = append(names, acc.Name)
+			toolCallNames = append(toolCallNames, acc.Name)
 		}
+		toolCalls = append(toolCalls, aggregatedToolCall{
+			ID:        acc.ID,
+			Name:      acc.Name,
+			Arguments: acc.ArgsBuf.String(),
+		})
 	}
 
-	return responseBody, truncated, inputTokens, outputTokens, cacheHitTokens, names
+	body := aggregatedResponse{
+		Content:          a.content.String(),
+		ReasoningContent: a.reasoning.String(),
+		ToolCalls:        toolCalls,
+		FinishReason:     a.finishReason,
+		Usage: aggregatedUsage{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			CachedTokens:     cacheHitTokens,
+		},
+	}
+
+	out, _ := json.Marshal(body) // fixed struct of strings/ints: cannot fail
+	return string(out), inputTokens, outputTokens, cacheHitTokens, toolCallNames
+}
+
+// aggregatedResponse is the audit body persisted for streaming responses. It
+// approximates the chat.completion message shape without pretending to be a
+// full API response.
+type aggregatedResponse struct {
+	Content          string               `json:"content"`
+	ReasoningContent string               `json:"reasoning_content"`
+	ToolCalls        []aggregatedToolCall `json:"tool_calls"`
+	FinishReason     string               `json:"finish_reason"`
+	Usage            aggregatedUsage      `json:"usage"`
+}
+
+type aggregatedToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type aggregatedUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
 }
 
 // --- SSE chunk parsing types ---
@@ -141,13 +208,15 @@ type sseChunk struct {
 }
 
 type sseChoice struct {
-	Index int      `json:"index"`
-	Delta sseDelta `json:"delta"`
+	Index        int      `json:"index"`
+	Delta        sseDelta `json:"delta"`
+	FinishReason string   `json:"finish_reason"`
 }
 
 type sseDelta struct {
-	Content   string        `json:"content"`
-	ToolCalls []sseToolCall `json:"tool_calls"`
+	Content          string        `json:"content"`
+	ReasoningContent string        `json:"reasoning_content"`
+	ToolCalls        []sseToolCall `json:"tool_calls"`
 }
 
 type sseToolCall struct {

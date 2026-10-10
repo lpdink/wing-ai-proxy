@@ -217,10 +217,9 @@ func (h *Handler) handleStream(
 
 	ar.RequestEnd = time.Now()
 
-	// Get aggregated results
-	respBody, truncated, inputTok, outputTok, cacheHit, toolCalls := forwarder.Aggregator().Result()
+	// Get the aggregated response message and usage for audit
+	respBody, inputTok, outputTok, cacheHit, toolCalls := forwarder.Aggregator().Result()
 	ar.ResponseBody = respBody
-	ar.Truncated = truncated
 	ar.InputTokens = inputTok
 	ar.OutputTokens = outputTok
 	ar.CacheHitTokens = cacheHit

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -180,7 +181,7 @@ func TestSSEAggregator_BasicContent(t *testing.T) {
 		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"content":" world"}}]}` + "\n\n",
-		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2}}}` + "\n\n",
 		`data: [DONE]` + "\n\n",
 	}
 
@@ -188,22 +189,71 @@ func TestSSEAggregator_BasicContent(t *testing.T) {
 		agg.ProcessChunk([]byte(chunk))
 	}
 
-	body, truncated, inputTok, outputTok, _, toolNames := agg.Result()
+	body, inputTok, outputTok, cacheHit, toolNames := agg.Result()
 
-	if truncated {
-		t.Error("should not be truncated")
-	}
 	if inputTok != 10 {
 		t.Errorf("input_tokens = %d, want 10", inputTok)
 	}
 	if outputTok != 5 {
 		t.Errorf("output_tokens = %d, want 5", outputTok)
 	}
+	if cacheHit != 2 {
+		t.Errorf("cache_hit_tokens = %d, want 2", cacheHit)
+	}
 	if len(toolNames) != 0 {
 		t.Errorf("unexpected tool calls: %v", toolNames)
 	}
-	if body == "" {
-		t.Error("response body should not be empty")
+
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v (body=%q)", err, body)
+	}
+	if msg.Content != "Hello world" {
+		t.Errorf("content = %q, want %q", msg.Content, "Hello world")
+	}
+	if msg.ReasoningContent != "" {
+		t.Errorf("reasoning_content = %q, want empty", msg.ReasoningContent)
+	}
+	if msg.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want %q", msg.FinishReason, "stop")
+	}
+	if len(msg.ToolCalls) != 0 {
+		t.Errorf("tool_calls = %v, want empty", msg.ToolCalls)
+	}
+	if msg.Usage.PromptTokens != 10 || msg.Usage.CompletionTokens != 5 || msg.Usage.CachedTokens != 2 {
+		t.Errorf("usage = %+v, want {10 5 2}", msg.Usage)
+	}
+}
+
+func TestSSEAggregator_ReasoningContent(t *testing.T) {
+	agg := NewSSEAggregator()
+
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think"}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"reasoning_content":" step by step."}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"content":"The answer is 42."}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+		`data: [DONE]` + "\n\n",
+	}
+
+	for _, chunk := range chunks {
+		agg.ProcessChunk([]byte(chunk))
+	}
+
+	body, _, _, _, _ := agg.Result()
+
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if msg.ReasoningContent != "Let me think step by step." {
+		t.Errorf("reasoning_content = %q, want %q", msg.ReasoningContent, "Let me think step by step.")
+	}
+	if msg.Content != "The answer is 42." {
+		t.Errorf("content = %q, want %q", msg.Content, "The answer is 42.")
+	}
+	if msg.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want %q", msg.FinishReason, "stop")
 	}
 }
 
@@ -215,7 +265,7 @@ func TestSSEAggregator_ToolCalls(t *testing.T) {
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hello\"}"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"calculator","arguments":"{}"}}]}}]}` + "\n\n",
-		`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
 		`data: [DONE]` + "\n\n",
 	}
 
@@ -223,33 +273,121 @@ func TestSSEAggregator_ToolCalls(t *testing.T) {
 		agg.ProcessChunk([]byte(chunk))
 	}
 
-	_, _, _, _, _, toolNames := agg.Result()
+	body, _, _, _, toolNames := agg.Result()
 
 	if len(toolNames) != 2 {
 		t.Fatalf("expected 2 tool calls, got %d", len(toolNames))
 	}
-
-	nameSet := make(map[string]bool)
-	for _, n := range toolNames {
-		nameSet[n] = true
+	if toolNames[0] != "search" || toolNames[1] != "calculator" {
+		t.Errorf("tool names = %v, expected [search calculator]", toolNames)
 	}
-	if !nameSet["search"] || !nameSet["calculator"] {
-		t.Errorf("tool names = %v, expected search and calculator", toolNames)
+
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if msg.FinishReason != "tool_calls" {
+		t.Errorf("finish_reason = %q, want %q", msg.FinishReason, "tool_calls")
+	}
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 aggregated tool calls, got %d", len(msg.ToolCalls))
+	}
+	if msg.ToolCalls[0].ID != "call_1" || msg.ToolCalls[0].Name != "search" || msg.ToolCalls[0].Arguments != `{"query":"hello"}` {
+		t.Errorf("tool call 0 = %+v, want id=call_1 name=search arguments={\"query\":\"hello\"}", msg.ToolCalls[0])
+	}
+	if msg.ToolCalls[1].ID != "call_2" || msg.ToolCalls[1].Name != "calculator" || msg.ToolCalls[1].Arguments != "{}" {
+		t.Errorf("tool call 1 = %+v", msg.ToolCalls[1])
 	}
 }
 
-func TestSSEAggregator_Truncation(t *testing.T) {
+// feedSSE feeds a stream in fixed-size chunks to exercise arbitrary chunk
+// boundaries, including cuts in the middle of an SSE line.
+func feedSSE(agg *SSEAggregator, stream string, chunkSize int) {
+	for i := 0; i < len(stream); i += chunkSize {
+		end := i + chunkSize
+		if end > len(stream) {
+			end = len(stream)
+		}
+		agg.ProcessChunk([]byte(stream[i:end]))
+	}
+}
+
+func TestSSEAggregator_SplitLinesAcrossChunks(t *testing.T) {
+	stream := `data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{"reasoning_content":"thinking..."}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{"content":" world"}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}` + "\n\n" +
+		`data: [DONE]` + "\n\n"
+
+	// Chunk size 1 cuts every line at every possible position; the other sizes
+	// exercise coarser boundaries.
+	for _, chunkSize := range []int{1, 3, 17, 64} {
+		agg := NewSSEAggregator()
+		feedSSE(agg, stream, chunkSize)
+
+		body, inputTok, outputTok, cacheHit, _ := agg.Result()
+		var msg aggregatedResponse
+		if err := json.Unmarshal([]byte(body), &msg); err != nil {
+			t.Fatalf("chunk size %d: aggregated body is not valid JSON: %v", chunkSize, err)
+		}
+		if msg.Content != "Hello world" {
+			t.Errorf("chunk size %d: content = %q, want %q", chunkSize, msg.Content, "Hello world")
+		}
+		if msg.ReasoningContent != "thinking..." {
+			t.Errorf("chunk size %d: reasoning_content = %q", chunkSize, msg.ReasoningContent)
+		}
+		if msg.FinishReason != "stop" {
+			t.Errorf("chunk size %d: finish_reason = %q", chunkSize, msg.FinishReason)
+		}
+		if inputTok != 7 || outputTok != 3 || cacheHit != 1 {
+			t.Errorf("chunk size %d: usage = %d/%d/%d, want 7/3/1", chunkSize, inputTok, outputTok, cacheHit)
+		}
+	}
+}
+
+func TestSSEAggregator_CRLFAndTrailingLineWithoutNewline(t *testing.T) {
+	// CRLF line endings and a final event without trailing newline must both
+	// be parsed.
+	stream := `data: {"choices":[{"index":0,"delta":{"content":"crlf"}}]}` + "\r\n\r\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\r\n\r\n" +
+		`data: [DONE]`
+
+	agg := NewSSEAggregator()
+	feedSSE(agg, stream, 5)
+
+	body, _, _, _, _ := agg.Result()
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if msg.Content != "crlf" {
+		t.Errorf("content = %q, want %q", msg.Content, "crlf")
+	}
+	if msg.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want %q", msg.FinishReason, "stop")
+	}
+}
+
+func TestSSEAggregator_LargeStream(t *testing.T) {
 	agg := NewSSEAggregator()
 
-	// Feed more than 10MB of data
-	bigChunk := bytes.Repeat([]byte("x"), 1024*1024) // 1MB chunks
-	for i := 0; i < 12; i++ {
-		agg.ProcessChunk(bigChunk)
+	// 11MB of aggregated content: previously anything beyond the 10MB raw
+	// stream limit was dropped; the aggregated result must now be complete.
+	const chunkCount = 11
+	const chunkSize = 1024 * 1024
+	payload := strings.Repeat("x", chunkSize)
+	for i := 0; i < chunkCount; i++ {
+		agg.ProcessChunk([]byte(`data: {"choices":[{"index":0,"delta":{"content":"` + payload + `"}}]}` + "\n\n"))
 	}
+	agg.ProcessChunk([]byte(`data: [DONE]` + "\n\n"))
 
-	_, truncated, _, _, _, _ := agg.Result()
-	if !truncated {
-		t.Error("expected truncation for > 10MB data")
+	body, _, _, _, _ := agg.Result()
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if len(msg.Content) != chunkCount*chunkSize {
+		t.Errorf("content length = %d, want %d", len(msg.Content), chunkCount*chunkSize)
 	}
 }
 
@@ -309,13 +447,53 @@ func TestStreamForwarder(t *testing.T) {
 		t.Error("client did not receive exact upstream data")
 	}
 
-	// Aggregator should have extracted usage
-	_, _, input, output, _, _ := sf.Aggregator().Result()
+	// Aggregator should have extracted usage and aggregated content
+	body, input, output, _, _ := sf.Aggregator().Result()
 	if input != 5 {
 		t.Errorf("aggregated input_tokens = %d, want 5", input)
 	}
 	if output != 3 {
 		t.Errorf("aggregated output_tokens = %d, want 3", output)
+	}
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if msg.Content != "Hi there" {
+		t.Errorf("aggregated content = %q, want %q", msg.Content, "Hi there")
+	}
+}
+
+func TestStreamForwarder_SplitAcrossReadBuffer(t *testing.T) {
+	// A single SSE line with a payload larger than the 32KB read buffer forces
+	// the forwarder to hand the aggregator chunks that split the line mid-JSON.
+	bigContent := strings.Repeat("A", 40*1024) // 40KB > 32KB read buffer
+	upstreamData := `data: {"choices":[{"index":0,"delta":{"content":"` + bigContent + `"}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{"content":" end"}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		`data: [DONE]` + "\n\n"
+
+	upstream := bytes.NewReader([]byte(upstreamData))
+	var client bytes.Buffer
+
+	sf := NewStreamForwarder(upstream, &client, nil)
+	if err := sf.Run(); err != nil {
+		t.Fatalf("stream forwarder error: %v", err)
+	}
+	if client.String() != upstreamData {
+		t.Error("client did not receive exact upstream data")
+	}
+
+	body, _, _, _, _ := sf.Aggregator().Result()
+	var msg aggregatedResponse
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("aggregated body is not valid JSON: %v", err)
+	}
+	if msg.Content != bigContent+" end" {
+		t.Errorf("aggregated content length = %d, want %d", len(msg.Content), len(bigContent)+4)
+	}
+	if msg.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want %q", msg.FinishReason, "stop")
 	}
 }
 

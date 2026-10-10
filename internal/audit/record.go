@@ -22,7 +22,6 @@ type Record struct {
 
 	RequestBody  string `json:"request_body"`
 	ResponseBody string `json:"response_body"`
-	Truncated    bool   `json:"truncated"`
 
 	StatusCode   int    `json:"status_code"`
 	ErrorMessage string `json:"error_message"`

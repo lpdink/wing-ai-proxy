@@ -73,10 +73,10 @@ func (s *SQLiteStore) Insert(r Record) error {
 	if r.IsStream {
 		isStream = 1
 	}
+	// Streaming responses are persisted as aggregated JSON instead of the raw
+	// SSE stream, so new rows are never truncated; the column is kept for
+	// schema compatibility with historical rows only.
 	truncated := 0
-	if r.Truncated {
-		truncated = 1
-	}
 
 	_, err = s.db.Exec(`
 		INSERT INTO audit_records (
