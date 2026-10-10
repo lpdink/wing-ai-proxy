@@ -51,11 +51,22 @@ func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
-// Insert writes an audit record to SQLite.
+// Insert writes an audit record to SQLite. Non-empty request/response bodies
+// are gzip-compressed and stored as BLOBs; empty bodies stay as empty TEXT so
+// that `typeof(column) = 'blob'` identifies compressed rows.
 func (s *SQLiteStore) Insert(r Record) error {
 	toolCallsJSON, err := json.Marshal(r.ToolCalls)
 	if err != nil {
 		toolCallsJSON = []byte("[]")
+	}
+
+	requestBody, err := compressBody(r.RequestBody)
+	if err != nil {
+		return fmt.Errorf("audit: compress request body: %w", err)
+	}
+	responseBody, err := compressBody(r.ResponseBody)
+	if err != nil {
+		return fmt.Errorf("audit: compress response body: %w", err)
 	}
 
 	isStream := 0
@@ -78,7 +89,7 @@ func (s *SQLiteStore) Insert(r Record) error {
 		r.RequestID, r.VirtualAPIKey, r.ProviderName, r.ModelShowName, r.ModelRealName,
 		r.RequestStart.Format(time.RFC3339Nano), r.FirstByteAt.Format(time.RFC3339Nano), r.RequestEnd.Format(time.RFC3339Nano),
 		r.InputTokens, r.OutputTokens, r.CacheHitTokens,
-		string(toolCallsJSON), isStream, r.RequestBody, r.ResponseBody, truncated,
+		string(toolCallsJSON), isStream, requestBody, responseBody, truncated,
 		r.StatusCode, r.ErrorMessage,
 	)
 
