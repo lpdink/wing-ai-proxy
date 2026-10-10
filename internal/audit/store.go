@@ -27,6 +27,14 @@ type SQLiteStore struct {
 	db *sql.DB
 }
 
+// sqliteDSN builds a modernc.org/sqlite DSN. The audit database may be written
+// concurrently by the proxy and read/updated by the compact command, so every
+// connection enables WAL and a busy timeout via _pragma parameters.
+func sqliteDSN(dsn string) string {
+	const params = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	return dsn + params
+}
+
 // NewSQLiteStore creates a new SQLite audit store, running migrations on startup.
 func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 	// Ensure the directory exists
@@ -37,7 +45,7 @@ func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn+"?_journal=WAL&_timeout=5000")
+	db, err := sql.Open("sqlite", sqliteDSN(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("audit: open sqlite: %w", err)
 	}
