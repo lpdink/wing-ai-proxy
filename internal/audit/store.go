@@ -27,6 +27,14 @@ type SQLiteStore struct {
 	db *sql.DB
 }
 
+// sqliteDSN builds a modernc.org/sqlite DSN. The audit database may be written
+// concurrently by the proxy and read/updated by the compact command, so every
+// connection enables WAL and a busy timeout via _pragma parameters.
+func sqliteDSN(dsn string) string {
+	const params = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	return dsn + params
+}
+
 // NewSQLiteStore creates a new SQLite audit store, running migrations on startup.
 func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 	// Ensure the directory exists
@@ -37,7 +45,7 @@ func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn+"?_journal=WAL&_timeout=5000")
+	db, err := sql.Open("sqlite", sqliteDSN(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("audit: open sqlite: %w", err)
 	}
@@ -51,21 +59,32 @@ func NewSQLiteStore(dsn string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
-// Insert writes an audit record to SQLite.
+// Insert writes an audit record to SQLite. Non-empty request/response bodies
+// are gzip-compressed and stored as BLOBs; empty bodies stay as empty TEXT so
+// that `typeof(column) = 'blob'` identifies compressed rows.
 func (s *SQLiteStore) Insert(r Record) error {
 	toolCallsJSON, err := json.Marshal(r.ToolCalls)
 	if err != nil {
 		toolCallsJSON = []byte("[]")
 	}
 
+	requestBody, err := compressBody(r.RequestBody)
+	if err != nil {
+		return fmt.Errorf("audit: compress request body: %w", err)
+	}
+	responseBody, err := compressBody(r.ResponseBody)
+	if err != nil {
+		return fmt.Errorf("audit: compress response body: %w", err)
+	}
+
 	isStream := 0
 	if r.IsStream {
 		isStream = 1
 	}
+	// Streaming responses are persisted as aggregated JSON instead of the raw
+	// SSE stream, so new rows are never truncated; the column is kept for
+	// schema compatibility with historical rows only.
 	truncated := 0
-	if r.Truncated {
-		truncated = 1
-	}
 
 	_, err = s.db.Exec(`
 		INSERT INTO audit_records (
@@ -78,7 +97,7 @@ func (s *SQLiteStore) Insert(r Record) error {
 		r.RequestID, r.VirtualAPIKey, r.ProviderName, r.ModelShowName, r.ModelRealName,
 		r.RequestStart.Format(time.RFC3339Nano), r.FirstByteAt.Format(time.RFC3339Nano), r.RequestEnd.Format(time.RFC3339Nano),
 		r.InputTokens, r.OutputTokens, r.CacheHitTokens,
-		string(toolCallsJSON), isStream, r.RequestBody, r.ResponseBody, truncated,
+		string(toolCallsJSON), isStream, requestBody, responseBody, truncated,
 		r.StatusCode, r.ErrorMessage,
 	)
 

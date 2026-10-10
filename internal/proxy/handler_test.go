@@ -1,11 +1,15 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +27,13 @@ func init() {
 }
 
 func setupTestRouter(upstream *httptest.Server, models map[string]string) (*gin.Engine, *audit.AsyncWriter) {
+	return setupTestRouterWithAuditDB(upstream, models, ":memory:")
+}
+
+// setupTestRouterWithAuditDB is like setupTestRouter but takes the audit
+// database DSN, so tests can open the same database afterwards (file-based
+// DSNs are stable across connections).
+func setupTestRouterWithAuditDB(upstream *httptest.Server, models map[string]string, auditDSN string) (*gin.Engine, *audit.AsyncWriter) {
 	cfg := config.ProviderConfig{
 		Name:    "test-provider",
 		Type:    "openai",
@@ -35,8 +46,10 @@ func setupTestRouter(upstream *httptest.Server, models map[string]string) (*gin.
 	p, _ := provider.NewProvider(cfg)
 	reg := provider.NewRegistry([]provider.Provider{p})
 
-	// Create in-memory audit store (use temp file)
-	store, _ := audit.NewSQLiteStore(":memory:")
+	store, err := audit.NewSQLiteStore(auditDSN)
+	if err != nil {
+		panic(err) // test helper: DSNs come from t.TempDir()
+	}
 	writer := audit.NewAsyncWriter(store, 100)
 
 	handler := NewHandler(reg, writer)
@@ -316,4 +329,152 @@ func TestCustomHeaderForwarding(t *testing.T) {
 	if receivedHeaders.Get("X-Trace-Id") != "abc-123" {
 		t.Errorf("trace header not forwarded")
 	}
+}
+
+func TestChatCompletions_StreamAuditFallback(t *testing.T) {
+	// When the upstream body for a streaming request is not an SSE stream
+	// (a JSON error payload or an HTML error page), the audit record must
+	// keep the raw bytes instead of an empty aggregate.
+	cases := []struct {
+		name       string
+		status     int
+		contentTyp string
+		body       string
+	}{
+		{
+			name:       "json error payload",
+			status:     http.StatusTooManyRequests,
+			contentTyp: "application/json",
+			body:       `{"error":{"message":"upstream overloaded","code":529}}`,
+		},
+		{
+			name:       "html error page on 200",
+			status:     http.StatusOK,
+			contentTyp: "text/html",
+			body:       "<html><body>502 Bad Gateway</body></html>",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentTyp)
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer upstream.Close()
+
+			dsn := filepath.Join(t.TempDir(), "audit.db")
+			r, writer := setupTestRouterWithAuditDB(upstream, map[string]string{"gpt-4": "gpt-4-turbo"}, dsn)
+
+			reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(reqBody))
+			req.Header.Set("Authorization", "Bearer sk-valid")
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+
+			writer.Drain()
+
+			status, auditBody := readLatestAuditBody(t, dsn)
+			if status != tc.status {
+				t.Errorf("audit status = %d, want %d", status, tc.status)
+			}
+			if auditBody != tc.body {
+				t.Errorf("audit response_body = %q, want the raw upstream bytes %q", auditBody, tc.body)
+			}
+		})
+	}
+}
+
+func TestChatCompletions_StreamAuditAggregate(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+
+		chunks := []string{
+			`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}` + "\n\n",
+			`data: {"choices":[{"index":0,"delta":{"content":" world"}}]}` + "\n\n",
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+			`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}` + "\n\n",
+			`data: [DONE]` + "\n\n",
+		}
+		for _, chunk := range chunks {
+			fmt.Fprint(w, chunk)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	dsn := filepath.Join(t.TempDir(), "audit.db")
+	r, writer := setupTestRouterWithAuditDB(upstream, map[string]string{"gpt-4": "gpt-4-turbo"}, dsn)
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer sk-valid")
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	writer.Drain()
+
+	status, auditBody := readLatestAuditBody(t, dsn)
+	if status != http.StatusOK {
+		t.Fatalf("audit status = %d, want 200", status)
+	}
+
+	var agg struct {
+		Content      string `json:"content"`
+		FinishReason string `json:"finish_reason"`
+		Usage        struct {
+			PromptTokens int `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(auditBody), &agg); err != nil {
+		t.Fatalf("audit response_body is not the aggregated JSON: %v (%q)", err, auditBody)
+	}
+	if agg.Content != "Hello world" {
+		t.Errorf("aggregated content = %q, want %q", agg.Content, "Hello world")
+	}
+	if agg.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want %q", agg.FinishReason, "stop")
+	}
+	if agg.Usage.PromptTokens != 5 {
+		t.Errorf("prompt_tokens = %d, want 5", agg.Usage.PromptTokens)
+	}
+}
+
+// readLatestAuditBody reads the status and (gzip-decoded where necessary)
+// response body of the most recent audit row from the database file.
+func readLatestAuditBody(t *testing.T, dsn string) (int, string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var status int
+	var raw []byte
+	var bodyType string
+	err = db.QueryRow(`SELECT status_code, response_body, typeof(response_body)
+		FROM audit_records ORDER BY id DESC LIMIT 1`).Scan(&status, &raw, &bodyType)
+	if err != nil {
+		t.Fatalf("read audit row: %v", err)
+	}
+
+	if bodyType == "blob" {
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("gzip reader: %v", err)
+		}
+		decoded, err := io.ReadAll(zr)
+		zr.Close()
+		if err != nil {
+			t.Fatalf("gunzip audit body: %v", err)
+		}
+		raw = decoded
+	}
+	return status, string(raw)
 }

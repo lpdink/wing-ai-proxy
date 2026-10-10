@@ -22,6 +22,15 @@ import (
 )
 
 func main() {
+	// Subcommand: wing-ai-proxy compact [--vacuum] [config-path]
+	if len(os.Args) > 1 && os.Args[1] == "compact" {
+		if err := runCompact(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)

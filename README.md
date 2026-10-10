@@ -7,7 +7,7 @@
 - **OpenAI 兼容协议** — `/models`、`/chat/completions`（流式 SSE + 非流式）
 - **Responses API 桥接** — `/v1/responses` 将 OpenAI Responses API 自动转换为 Chat Completions 转发上游，兼容 Codex CLI 等工具
 - **多 Provider 路由** — 支持多个上游（DashScope、OpenAI 等），模型别名映射
-- **全量审计** — 异步写入 SQLite，记录请求/响应体、token 用量、首包延迟
+- **全量审计** — 异步写入 SQLite（WAL），请求/响应体 gzip 压缩存储；流式响应保存聚合结果，记录 token 用量、首包延迟
 - **配置热加载** — 修改 YAML 配置自动生效，无需重启
 - **可观测性** — 结构化 JSON 日志、Prometheus `/metrics`、`/health` 健康检查
 - **零修改透传** — 不修改任何 header 或 body（仅替换 `model` 字段和上游 `Authorization`）
@@ -161,7 +161,7 @@ WING_API_KEY="sk-your-virtual-key" codex
 
 ### 审计查询
 
-审计数据存储在 SQLite，常见查询示例：
+审计数据存储在 SQLite（WAL 模式），常见查询示例：
 
 ```sql
 -- 某个 Key 的请求次数和 token 用量
@@ -186,6 +186,48 @@ FROM audit_records, json_each(audit_records.tool_calls)
 GROUP BY tool_name ORDER BY call_count DESC;
 ```
 
+### 审计存储格式
+
+- `request_body` / `response_body`：非空内容以 **gzip 压缩后的 BLOB** 存储；空内容仍为空字符串。（提示：几十字节级的极小 body 经 gzip 后可能略大于原文，固定开销约 25 字节，量级可忽略。）
+- 流式请求（`/chat/completions`）的 `response_body` 保存**聚合后的 JSON**（不再保存原始 SSE 流），形如：
+  ```json
+  {"content":"...","reasoning_content":"...","tool_calls":[{"id":"...","name":"...","arguments":"..."}],"finish_reason":"stop","usage":{"prompt_tokens":0,"completion_tokens":0,"cached_tokens":0}}
+  ```
+  已知限制：上游 `n > 1` 的多个 choice 会合并为单条 message（本网关非目标场景）。
+- 非 SSE 响应（如上游错误 JSON、HTML 错误页）：流式请求的 `response_body` 保存**原始响应字节（最多前 1MB）**，避免审计里只剩空聚合体、看不到失败原因。
+- 已知差异：`/v1/responses` 的流式审计保存聚合后的纯文本 content（不做 JSON 包装），与 `/chat/completions` 的聚合 JSON 形态不同。
+- `truncated` 列仅为兼容历史数据保留，新写入恒为 0。
+- 升级前写入的历史行仍是明文 TEXT。可用 `typeof(request_body)` 区分：`'text'` = 明文（或空串），`'blob'` = 已压缩；执行一次 `compact`（见下）可把历史数据全部压缩。
+
+读回请求体/响应体（新格式为 gzip BLOB）：
+
+```bash
+# 导出并解压（sqlite3 CLI 需带 fileio 扩展，常见发行版默认包含）
+sqlite3 audit.db "SELECT writefile('/tmp/body.gz', request_body) FROM audit_records WHERE id = 1;" && gunzip -c /tmp/body.gz
+```
+
+```python
+# Python 3 读回，自动区分历史明文与新 BLOB
+import gzip, sqlite3
+body = sqlite3.connect("audit.db").execute(
+    "SELECT request_body FROM audit_records WHERE id = 1").fetchone()[0]
+print(gzip.decompress(body).decode() if isinstance(body, bytes) else body)
+```
+
+### 审计库维护（compact 子命令）
+
+升级后建议执行一次 `compact`，把历史明文的请求/响应体压缩回写。可在服务运行中执行：分批（每批 500 行、累计 body 上限 32MB）+ 每批一个事务，仅处理 `typeof(...) = 'text'` 的历史行，不会影响正在写入的新数据。
+
+```bash
+./bin/wing-ai-proxy compact                      # 使用默认配置路径
+./bin/wing-ai-proxy compact /path/to/config.yaml # 指定配置文件
+./bin/wing-ai-proxy compact --vacuum             # 压缩完成后执行 VACUUM 回收磁盘空间
+```
+
+- 逐批打印进度（已处理行数、输入/输出字节累计）。
+- 默认不回收磁盘空间，结束时提示可加 `--vacuum`；`VACUUM` 需要相当于库文件大小的临时磁盘空间，且需要数据库空闲——若 WAL checkpoint 因并发读者无法完成（busy），会提示先在业务低峰期重试。
+- 已知限制：历史流式响应体压缩后仍是原始 SSE 文本，不会重新聚合。
+
 ## 开发
 
 ### 前置要求
@@ -207,9 +249,9 @@ make clean    # 清理构建产物
 
 ```
 wing-ai-proxy/
-├── cmd/wing-ai-proxy/main.go   # 入口：组装依赖、启动服务、优雅关闭
+├── cmd/wing-ai-proxy/main.go   # 入口：组装依赖、启动服务、优雅关闭（compact 子命令见 compact.go）
 ├── internal/
-│   ├── audit/                   # 审计：Record + SQLite Store + AsyncWriter + SSE Aggregator
+│   ├── audit/                   # 审计：Record + SQLite Store（gzip 压缩）+ AsyncWriter + SSE 聚合 + compact
 │   ├── config/                  # 配置：YAML 加载/校验 + fsnotify 热加载
 │   ├── metrics/                 # Prometheus 指标定义
 │   ├── middleware/               # RequestID + Auth 中间件
